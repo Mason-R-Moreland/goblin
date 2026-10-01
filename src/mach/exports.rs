@@ -8,6 +8,7 @@
 
 use crate::error;
 use crate::mach::load_command;
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::{self, Debug};
@@ -179,19 +180,6 @@ pub struct ExportTrie<'a> {
 }
 
 impl<'a> ExportTrie<'a> {
-    #[inline]
-    fn walk_nodes(
-        &self,
-        libs: &[&'a str],
-        branches: Vec<(String, usize)>,
-        acc: &mut Vec<Export<'a>>,
-    ) -> error::Result<()> {
-        for (symbol, next_node) in branches {
-            self.walk_trie(libs, symbol, next_node, acc)?;
-        }
-        Ok(())
-    }
-
     // current_symbol can be a str iiuc
     fn walk_branches(
         &self,
@@ -228,41 +216,41 @@ impl<'a> ExportTrie<'a> {
         start: usize,
         exports: &mut Vec<Export<'a>>,
     ) -> error::Result<()> {
-        if start < self.location.end {
+        // A well-formed trie is a tree, so every node is reached exactly once.
+        // Walk it with an explicit stack so a deep trie cannot exhaust the call
+        // stack, and reject any node reached twice: a cycle would never
+        // terminate, and shared children make the walk exponential.
+        let mut visited = BTreeSet::new();
+        let mut stack = vec![(current_symbol, start)];
+        while let Some((current_symbol, start)) = stack.pop() {
+            if start >= self.location.end {
+                continue;
+            }
+            if !visited.insert(start) {
+                return Err(error::Error::Malformed(format!(
+                    "export trie node at {:#x} is reachable more than once",
+                    start
+                )));
+            }
             let mut offset = start;
             let terminal_size = Uleb128::read(&self.data, &mut offset)?;
-            // let mut input = String::new();
-            // ::std::io::stdin().read_line(&mut input).unwrap();
-            // println!("@ {:#x} node: {:#x} current_symbol: {}", start, terminal_size, current_symbol);
-            if terminal_size == 0 {
+            let branches = if terminal_size == 0 {
                 let nbranches = Uleb128::read(&self.data, &mut offset)? as usize;
-                //println!("\t@ {:#x} BRAN {}", *offset, nbranches);
-                let branches = self.walk_branches(nbranches, current_symbol, offset)?;
-                self.walk_nodes(libs, branches, exports)
+                self.walk_branches(nbranches, current_symbol, offset)?
             } else {
                 // terminal node, but the tricky part is that they can have children...
                 let pos = offset;
                 let children_start = &mut (pos + terminal_size as usize);
                 let nchildren = Uleb128::read(&self.data, children_start)? as usize;
                 let flags = Uleb128::read(&self.data, &mut offset)?;
-                //println!("\t@ {:#x} TERM {} flags: {:#x}", offset, nchildren, flags);
                 let info = ExportInfo::parse(&self.data, libs, flags, offset)?;
-                let export = Export::new(current_symbol.clone(), info);
-                //println!("\t{:?}", &export);
-                exports.push(export);
-                if nchildren == 0 {
-                    // this branch is done
-                    Ok(())
-                } else {
-                    // more branches to walk
-                    let branches =
-                        self.walk_branches(nchildren, current_symbol, *children_start)?;
-                    self.walk_nodes(libs, branches, exports)
-                }
-            }
-        } else {
-            Ok(())
+                exports.push(Export::new(current_symbol.clone(), info));
+                self.walk_branches(nchildren, current_symbol, *children_start)?
+            };
+            // reversed so children are visited in trie order
+            stack.extend(branches.into_iter().rev());
         }
+        Ok(())
     }
 
     fn new_impl(bytes: &'a [u8], start: usize, size: usize) -> Self {

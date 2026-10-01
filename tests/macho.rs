@@ -647,3 +647,66 @@ fn fuzzed_memory_growth() {
     let bytes = b"\xfe\xed\xfa\xce\xce\xfa\xff\xfe\xcf*\x06;\xfe\xfa\xce\xff\xff\xff\xff0\xce:\xfa\xffj\xfe\xcf*\x06\x00;\xc6";
     assert!(Mach::parse(&bytes[..]).is_err());
 }
+
+/// A minimal 64-bit Mach-O whose only load command is an `LC_DYLD_EXPORTS_TRIE`
+/// covering `trie`.
+fn macho_with_export_trie(trie: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for v in [0xfeedfacf_u32, 0x0100000c, 0, 6, 1, 16, 0, 0] {
+        bytes.extend(v.to_le_bytes());
+    }
+    for v in [0x80000033_u32, 16, 48, trie.len() as u32] {
+        bytes.extend(v.to_le_bytes());
+    }
+    bytes.extend(trie);
+    bytes
+}
+
+#[test]
+fn export_trie_cycle() {
+    // A single node whose only child points back at itself; this used to
+    // recurse until the stack overflowed.
+    let bytes = macho_with_export_trie(&[0x00, 0x01, b'a', 0x00, 0x00]);
+    let macho = MachO::parse(&bytes, 0).unwrap();
+    assert!(macho.exports().is_err());
+}
+
+#[test]
+fn export_trie_shared_children() {
+    // 40 nodes, each with two children pointing at the next node: no cycle, but
+    // 2^40 paths. Every node must be visited at most once.
+    let mut trie = Vec::new();
+    for i in 0..40 {
+        let next = (i + 1) * 10;
+        let (lo, hi) = (0x80 | (next & 0x7f) as u8, (next >> 7) as u8);
+        trie.extend([0x00, 0x02, b'a', 0x00, lo, hi, b'b', 0x00, lo, hi]);
+    }
+    trie.extend([0x02, 0x00, 0x00, 0x00]);
+    let bytes = macho_with_export_trie(&trie);
+    let macho = MachO::parse(&bytes, 0).unwrap();
+    assert!(macho.exports().is_err());
+}
+
+#[test]
+fn export_trie_deep_chain() {
+    // A well-formed but deep trie: 100_000 nodes in a single chain, ending in
+    // one export. This used to overflow the stack.
+    let depth = 100_000;
+    let mut trie = Vec::new();
+    for i in 0..depth {
+        let mut next = (i + 1) * 8;
+        trie.extend([0x00, 0x01, b'a', 0x00]);
+        for j in 0..4 {
+            let more = if j < 3 { 0x80 } else { 0x00 };
+            trie.push(more | (next & 0x7f) as u8);
+            next >>= 7;
+        }
+    }
+    trie.extend([0x02, 0x00, 0x2a, 0x00]);
+    let bytes = macho_with_export_trie(&trie);
+    let macho = MachO::parse(&bytes, 0).unwrap();
+    let exports = macho.exports().unwrap();
+    assert_eq!(exports.len(), 1);
+    assert_eq!(exports[0].name.len(), depth);
+    assert_eq!(exports[0].offset, 0x2a);
+}
